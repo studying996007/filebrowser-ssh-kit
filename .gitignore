@@ -1,0 +1,15 @@
+.env
+*.local.*
+*.db
+*.log
+*.lock
+*.watchdog.ready
+__pycache__/
+.venv/
+.DS_Store
+# Local agent/editor tooling — never part of the published kit
+.claude/
+.mcp.json
+# per-user launcher artifacts (generated on the client machine, never committed)
+client/**/config.txt
+*.app/
