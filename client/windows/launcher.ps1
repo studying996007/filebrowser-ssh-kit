@@ -194,7 +194,8 @@ $url = "http://localhost:$port/"
 #    -PassThru keeps the ssh child process object so we can kill exactly this tunnel when the window closes.
 if (-not (Test-Listen $port)) {
   Step("Opening SSH tunnel (local port $port)...")
-  $script:ssh = Start-Process ssh -PassThru -WindowStyle Hidden -ArgumentList @("-N","-o","ConnectTimeout=8","-o","BatchMode=yes","-o","ServerAliveInterval=15","-o","ServerAliveCountMax=3","-o","ExitOnForwardFailure=yes","-L","${port}:127.0.0.1:${rport}","$srvHost")
+  # ServerAliveCountMax=6: an established tunnel tolerates ~90s (15x6) of silence before being declared dead, so brief jitter self-heals; a truly dead tunnel is handled by the auto-reconnect session loop below.
+  $script:ssh = Start-Process ssh -PassThru -WindowStyle Hidden -ArgumentList @("-N","-o","ConnectTimeout=8","-o","BatchMode=yes","-o","ServerAliveInterval=15","-o","ServerAliveCountMax=6","-o","ExitOnForwardFailure=yes","-L","${port}:127.0.0.1:${rport}","$srvHost")
   $script:ownsTunnel = $true
   Step("Waiting for port to become ready...")
   # Wait > ssh ConnectTimeout (8s) above so we never give up while ssh is still legitimately connecting (M4): 40 * 250ms = 10s.
@@ -238,18 +239,43 @@ if (Svc-Ok) {
     $btn.SetBounds(150, 92, 120, 30)
     $btn.Visible    = $true
     $form.TopMost   = $false
-    # Session loop: window closed = user disconnected; ssh child exits = tunnel died mid-session (timeout/sleep/network drop)
-    # -> show an explicit "reconnect" message rather than leaving the window green with "connected" while the browser gets connection refused (C11)
-    while (-not $form.IsDisposed -and $script:ssh -and -not $script:ssh.HasExited) {
-      [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50
-    }
-    if (-not $form.IsDisposed -and $script:ssh -and $script:ssh.HasExited) {
-      $lblTitle.Text      = "Connection Lost"
-      $lblTitle.ForeColor = [System.Drawing.Color]::Firebrick
-      $lblStatus.SetBounds(16, 46, 388, 60)
-      $lblStatus.Text     = "The SSH tunnel has closed (network drop or computer sleep).`nClose this window, then double-click the Connector shortcut to reconnect."
-      $btn.Text           = "Close"
-      while (-not $form.IsDisposed) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+    # Session loop + auto-reconnect: window closed = user disconnected (FormClosed kills the current tunnel);
+    # ssh child exits = tunnel died mid-session (sleep / jitter / network drop) -> automatically rebuild the tunnel
+    # with backoff (same port; the open browser tab needs no URL change), instead of asking the user to relaunch.
+    # Reconnect progress/success/failure is shown in the same window. $script:ssh always points at the latest tunnel.
+    $reDelay = 2
+    while (-not $form.IsDisposed) {
+      if ($script:ssh -and -not $script:ssh.HasExited) {
+        # Tunnel healthy: if we just recovered from a reconnect, restore the "Connected" title/status
+        if ($lblTitle.Text -ne "Connected to $srvHost") {
+          $lblTitle.Text      = "Connected to $srvHost"
+          $lblTitle.ForeColor = [System.Drawing.SystemColors]::ControlText
+          $lblStatus.Text     = "Local port $port - close this window to disconnect (closing the browser does not disconnect; auto-reconnects on network drop)"
+        }
+        $reDelay = 2
+        [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100
+        continue
+      }
+      # -- tunnel dropped -> auto-reconnect --
+      $lblTitle.Text      = "Reconnecting..."
+      $lblTitle.ForeColor = [System.Drawing.Color]::DarkOrange
+      $lblStatus.Text     = "Network drop or sleep closed the tunnel; reconnecting to $srvHost (local port $port)..."
+      [System.Windows.Forms.Application]::DoEvents()
+      $script:ssh = Start-Process ssh -PassThru -WindowStyle Hidden -ArgumentList @("-N","-o","ConnectTimeout=8","-o","BatchMode=yes","-o","ServerAliveInterval=15","-o","ServerAliveCountMax=6","-o","ExitOnForwardFailure=yes","-L","${port}:127.0.0.1:${rport}","$srvHost")
+      # Wait for the port to become ready (~10s); the window stays closable (close -> IsDisposed -> break out)
+      $ok = $false
+      for ($i = 0; $i -lt 40 -and -not $form.IsDisposed; $i++) {
+        if (Test-Listen $port) { $ok = $true; break }
+        [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 250
+      }
+      if ($form.IsDisposed) { break }
+      if (-not $ok) {
+        # This attempt failed -> reap it and back off before retrying (2 -> 4 -> ... -> 30s cap)
+        if ($script:ssh -and -not $script:ssh.HasExited) { try { Stop-Process -Id $script:ssh.Id -Force -ErrorAction SilentlyContinue } catch {} }
+        $lblStatus.Text = "Reconnect failed, retrying in $reDelay s... (close the window to give up)"
+        for ($i = 0; $i -lt ($reDelay * 10) -and -not $form.IsDisposed; $i++) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
+        $reDelay = [Math]::Min($reDelay * 2, 30)
+      }
     }
     exit
   } else {

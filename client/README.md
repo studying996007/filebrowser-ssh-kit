@@ -35,7 +35,7 @@ If it connects immediately (first time: type `yes` to accept the host key) **wit
 - If double-clicking shows "unknown developer": right-click -> **Open** -> **Open** again; or go to **System Settings -> Privacy & Security** and click **Open Anyway**.
 - The installer asks for the SSH alias (default `myserver`), the remote start command, and the local port (**a unique idle port is auto-selected per server** — accept the default), then creates **`<alias> Connector.app`** on your Desktop (e.g. `myserver Connector`).
 
-**Use:** double-click **`<alias> Connector`** on the Desktop (e.g. `myserver Connector`) -> macOS notifications appear in the top-right corner at each stage (connecting -> tunnel -> opening browser). After a moment the browser opens automatically. A small **"Disconnect"** dialog will appear — while it is open, the connection is active. **Click "Disconnect" when you are done** to end the session and release the port (closing the browser tab does not disconnect — use this dialog).
+**Use:** double-click **`<alias> Connector`** on the Desktop (e.g. `myserver Connector`) -> macOS notifications appear in the top-right corner at each stage (connecting -> tunnel -> opening browser). After a moment the browser opens automatically. A small **"Disconnect"** dialog will appear — while it is open, the connection is active. **Click "Disconnect" when you are done** to end the session and release the port (closing the browser tab does not disconnect — use this dialog; **if the network drops or the Mac sleeps, the tunnel auto-reconnects** — no need to relaunch).
 
 ---
 
@@ -46,7 +46,7 @@ If it connects immediately (first time: type `yes` to accept the host key) **wit
 - Dialogs will ask for the SSH alias (default `myserver`), the remote start command, and the local port (**a unique idle port is auto-selected per server** — accept the default). A shortcut named **`<alias> Connector`** is created on your Desktop (e.g. `myserver Connector`).
 - If SmartScreen blocks it: click **More info -> Run anyway**.
 
-**Use:** double-click **`<alias> Connector`** on the Desktop -> a small **Connector window** opens (shows tunnel / port / browser progress) -> after connecting, the browser opens automatically. The window stays open showing "Connected — close to disconnect". **Close this window (or click "Disconnect") to end the session and release the port** (closing the browser does not disconnect). No black console window at any point.
+**Use:** double-click **`<alias> Connector`** on the Desktop -> a small **Connector window** opens (shows tunnel / port / browser progress) -> after connecting, the browser opens automatically. The window stays open showing "Connected — close to disconnect" (**auto-reconnects if the network drops or the PC sleeps**). **Close this window (or click "Disconnect") to end the session and release the port** (closing the browser does not disconnect). No black console window at any point.
 
 ---
 
@@ -67,7 +67,7 @@ If an older Connector used port 8080 for every server, you may have connected to
 | "Cannot reach server" dialog | Verify `ssh myserver` works without a password in Terminal / PowerShell; first time, type `yes` to accept the host key |
 | Browser opens but page does not load | The server service is probably not running; the launcher auto-starts it — wait a few seconds and double-click again; if still failing, run `bash ~/filebrowser-ssh-kit/server/start.sh` on the server manually |
 | Want to disconnect / port still in use | Close the Connector window (macOS: click "Disconnect" in the dialog) — that window is the on/off switch for the current session |
-| Connection drops / "Connection lost" message | Usually a network drop or computer sleep killed the SSH tunnel; close the Connector, then double-click it again to reconnect |
+| Connection drops occasionally | Usually a network drop or computer sleep closed the SSH tunnel; the Connector **auto-reconnects** (title shows "Reconnecting..." then returns to "Connected"; macOS shows a "Reconnected" notification) — just wait, no action needed. If it never recovers, close the Connector window (macOS: close the dialog) and double-click again |
 | Multiple servers / port clash | Run the installer once per server — each gets its own port and shortcut; if ports still clash, the launcher validates identity and self-heals by switching ports |
 | Login credentials | Use the account you created during install |
 
@@ -78,6 +78,7 @@ If an older Connector used port 8080 for every server, you may have connected to
 - **Zero dependencies:** macOS uses built-in `ssh` / `osascript` / `open`; Windows uses built-in OpenSSH + PowerShell. Nothing is installed.
 - **Feedback and control:** on Windows a Connector window shows progress; on macOS notifications appear at each stage. After connecting, the window (macOS: the "Disconnect" dialog) acts as the session switch — close it to disconnect.
 - **Tunnel:** `ssh -N -L <local-port>:127.0.0.1:8080 <alias>`, owned as a **child process** of the launcher. Closing the Connector (macOS: clicking "Disconnect") kills the tunnel and releases the port — nothing lingers in the background. (The remote port `8080` is the server's `PX_PORT` default; if you changed `PX_PORT` on the server, re-run the installer so the connector targets the new port.)
+- **Auto-reconnect:** an established tunnel uses `ServerAliveInterval=15 x6` (~90s) so brief network jitter does not drop it; if it truly closes (sleep / extended outage) the launcher rebuilds it to the same port with backoff (2 -> 4 -> ... -> 30s cap), showing progress in the window / via notifications, until you disconnect — no manual relaunch.
 - **Per-server ports:** each server gets a distinct local port (installer derives it from the alias, avoiding the crowded 8080 range). Multiple servers can be open simultaneously without interfering.
 - **Wrong-server protection (identity check + self-heal):** every server response includes an `X-FB-Server` header. Before using a local port, if the port is occupied, the launcher checks whether "the other end is actually this server": reuses the tunnel if yes; **switches to a free port if no** (another server's tunnel or an unrelated program). You can never land on the wrong server even if ports collide.
 - **Auto-start:** if the tunnel is up but the service is not responding, the launcher runs the remote start command over SSH.

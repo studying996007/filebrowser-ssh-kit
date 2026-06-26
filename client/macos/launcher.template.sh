@@ -59,8 +59,11 @@ URL="http://localhost:${PORT}/"
 if ! port_open; then
   note "Opening SSH tunnel..."
   ERRF="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/fm_ssh_err.XXXXXX")"   # unique temp file each time to avoid stale/concurrent error mix-up
+  # ServerAliveCountMax=6: an established tunnel tolerates ~90s (15x6) of silence before being declared dead, so brief
+  # network jitter self-heals instead of dropping; a truly dead tunnel is handled by the auto-reconnect loop below.
+  # Initial-connect failure is detected by ConnectTimeout + the port-ready timeout, independent of this value.
   /usr/bin/ssh -N -o ConnectTimeout=8 -o BatchMode=yes \
-    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o ExitOnForwardFailure=yes \
     -L "${PORT}:127.0.0.1:${RPORT}" "$HOST" 2>"$ERRF" &
   SSH_PID=$!
   OWNS=1
@@ -102,21 +105,37 @@ fi
 note "Connected, opening browser"
 /usr/bin/open "$URL"
 
-# 4) Session control: only manage the lifecycle of tunnels this script opened (OWNS=1).
-#    Dialog open = connection alive; click "Disconnect" or close = script exits -> EXIT trap kills tunnel, releases port.
-#    (When reusing an existing tunnel OWNS=0: no trap is set, we exit after opening the browser and never kill a tunnel we did not own.)
+# 4) Session control + auto-reconnect: only manage the lifecycle of tunnels this script opened (OWNS=1).
+#    The "Disconnect" dialog runs in the background; the foreground loop supervises the tunnel and, if it dies
+#    (sleep / network jitter / Wi-Fi switch), automatically rebuilds it with backoff -- no manual re-launch.
+#    Clicking "Disconnect" or closing the dialog drops STOPF -> the loop stops and exits (EXIT trap kills the
+#    current tunnel and releases the port). When reusing an existing tunnel (OWNS=0) this block is skipped.
 if [ "$OWNS" = "1" ]; then
-  # Background watchdog: if the tunnel dies mid-session (timeout/sleep/network drop -> ssh exits), push a notification
-  # so the user knows to reconnect, rather than leaving the dialog open with a false "connected" impression (C11)
-  ( while kill -0 "$SSH_PID" 2>/dev/null; do sleep 3; done
-    note "Connection lost (network drop or sleep). Close this dialog then double-click the Connector to reconnect." ) &
-  WATCH=$!
-  /usr/bin/osascript -e "display dialog \"Connected to ${HOST} (local port ${PORT})\n\nClick Disconnect when you are done.\nClosing the browser does not disconnect -- use this dialog to disconnect.\" with title \"$NAME\" buttons {\"Disconnect\"} default button 1" >/dev/null 2>&1
-  DLG_RC=$?
-  kill "$WATCH" 2>/dev/null || true
-  # C10: dialog exits abnormally (no GUI/Aqua session etc., non-zero exit code) but tunnel is still alive ->
-  #      do not immediately trigger EXIT trap and kill the good tunnel; instead wait for the tunnel process to finish naturally.
-  if [ "$DLG_RC" -ne 0 ] && kill -0 "$SSH_PID" 2>/dev/null; then
-    wait "$SSH_PID" 2>/dev/null || true
-  fi
+  # STOPF = user-requested-disconnect signal (written when the dialog returns); DLGRC = dialog exit code (0 = clicked Disconnect, non-zero = no GUI to show it)
+  STOPF="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/fm_stop.XXXXXX")"; DLGRC="${STOPF}.rc"; /bin/rm -f "$STOPF"
+  ( /usr/bin/osascript -e "display dialog \"Connected to ${HOST} (local port ${PORT})\n\nClick Disconnect when you are done.\nClosing the browser does not disconnect; the connection auto-reconnects if the network drops.\" with title \"$NAME\" buttons {\"Disconnect\"} default button 1" >/dev/null 2>&1
+    echo $? > "$DLGRC"; : > "$STOPF" ) &
+  DLG=$!
+  # EXIT trap: clean up the dialog and the CURRENT tunnel (SSH_PID is updated inside the loop, so the trap kills the latest one).
+  trap 'kill "$DLG" 2>/dev/null; kill "$SSH_PID" 2>/dev/null; /bin/rm -f "$STOPF" "$DLGRC"' EXIT
+  reconnecting=0; delay=2
+  while :; do
+    if [ -f "$STOPF" ]; then
+      [ "$(/bin/cat "$DLGRC" 2>/dev/null)" = "0" ] && break    # user clicked Disconnect -> end session
+      wait "$SSH_PID" 2>/dev/null; break                        # dialog could not display (no GUI/Aqua) -> fall back to "hold until the tunnel dies"
+    fi
+    if kill -0 "$SSH_PID" 2>/dev/null; then
+      [ "$reconnecting" = "1" ] && { note "Reconnected to ${HOST}"; reconnecting=0; }
+      delay=2; sleep 3; continue
+    fi
+    # -- tunnel died -> auto-reconnect (same port; the already-open browser tab needs no URL change) --
+    [ "$reconnecting" = "0" ] && { note "Connection lost, reconnecting to ${HOST}..."; reconnecting=1; }
+    /usr/bin/ssh -N -o ConnectTimeout=8 -o BatchMode=yes \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o ExitOnForwardFailure=yes \
+      -L "${PORT}:127.0.0.1:${RPORT}" "$HOST" >/dev/null 2>&1 &
+    SSH_PID=$!
+    if wait_for port_open 40 0.25; then delay=2; continue; fi   # rebuilt -> next loop sees it alive and notifies "Reconnected"
+    kill "$SSH_PID" 2>/dev/null || true                         # this attempt failed -> back off and retry (loop will break if the user disconnected)
+    [ -f "$STOPF" ] || { sleep "$delay"; delay=$((delay*2)); [ "$delay" -gt 30 ] && delay=30; }
+  done
 fi
